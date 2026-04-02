@@ -1,3 +1,4 @@
+use crate::Node;
 use crate::app_state::RaftType;
 use crate::helpers::{deserialize, get_raft_metrics};
 use crate::network::handshake::HandshakeSecret;
@@ -7,7 +8,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use chrono::Utc;
 use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, upgrade};
-use openraft::ServerState;
+use openraft::{RaftMetrics, ServerState};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::ops::{Deref, Sub};
@@ -118,20 +119,8 @@ pub async fn ready(state: AppStateExt) -> Result<(), Error> {
                 return Err(Error::Error("sqlite raft is not running".into()));
             }
 
-            // make sure we are a voting cluster member
             let metrics = get_raft_metrics(&state, &RaftType::Sqlite).await;
-            if metrics.state == ServerState::Learner
-                || metrics.state == ServerState::Shutdown
-                || !metrics
-                    .membership_config
-                    .voter_ids()
-                    .any(|id| id == state.id)
-            {
-                warn!("not yet a voting member of the sqlite raft");
-                return Err(Error::Error(
-                    "not yet a voting member of the sqlite raft".into(),
-                ));
-            }
+            ensure_ready_member(&state, &metrics, "sqlite")?;
 
             if metrics.current_leader.is_none() && (state.id != 1 || secs_since_start < 10) {
                 warn!("sqlite raft leader vote in progress - secs_since_start: {secs_since_start}");
@@ -157,20 +146,8 @@ pub async fn ready(state: AppStateExt) -> Result<(), Error> {
                 return Err(Error::Error("cache raft is not running".into()));
             }
 
-            // make sure we are a voting cluster member
             let metrics = get_raft_metrics(&state, &RaftType::Cache).await;
-            if metrics.state == ServerState::Learner
-                || metrics.state == ServerState::Shutdown
-                || !metrics
-                    .membership_config
-                    .voter_ids()
-                    .any(|id| id == state.id)
-            {
-                warn!("not yet a voting member of the cache raft");
-                return Err(Error::Error(
-                    "not yet a voting member of the cache raft".into(),
-                ));
-            }
+            ensure_ready_member(&state, &metrics, "cache")?;
 
             if metrics.current_leader.is_none() && (state.id != 1 || secs_since_start < 10) {
                 warn!("cache raft leader vote in progress");
@@ -180,6 +157,32 @@ pub async fn ready(state: AppStateExt) -> Result<(), Error> {
                 ));
             }
         }
+    }
+
+    Ok(())
+}
+
+fn ensure_ready_member(
+    state: &AppStateExt,
+    metrics: &RaftMetrics<u64, Node>,
+    raft_label: &'static str,
+) -> Result<(), Error> {
+    let is_voter = metrics
+        .membership_config
+        .voter_ids()
+        .any(|id| id == state.id);
+    let is_member = metrics
+        .membership_config
+        .nodes()
+        .any(|(id, _)| *id == state.id);
+    let is_acceptable_learner =
+        state.learner_only && metrics.state == ServerState::Learner && is_member;
+
+    if metrics.state == ServerState::Shutdown || (!is_voter && !is_acceptable_learner) {
+        warn!("not yet a ready member of the {raft_label} raft");
+        return Err(Error::Error(
+            format!("not yet a ready member of the {raft_label} raft").into(),
+        ));
     }
 
     Ok(())
