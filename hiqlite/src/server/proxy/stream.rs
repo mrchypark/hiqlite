@@ -176,6 +176,37 @@ pub async fn handle_socket(
                     }
                 }
 
+                ApiStreamRequestPayload::TransactionWithRaftSerializedTimestamp(queries) => {
+                    let res = match client
+                        .txn_with_raft_serialized_timestamp_execute(queries.clone())
+                        .await
+                    {
+                        Ok(res) => Ok(res),
+                        Err(err) => {
+                            if client
+                                .was_leader_update_error(
+                                    &err,
+                                    &client.inner.leader_db,
+                                    &client.inner.tx_client_db,
+                                )
+                                .await
+                            {
+                                client
+                                    .txn_with_raft_serialized_timestamp_execute(queries)
+                                    .await
+                            } else {
+                                Err(err)
+                            }
+                        }
+                    };
+                    ApiStreamResponse {
+                        request_id,
+                        result: ApiStreamResponsePayload::TransactionWithRaftSerializedTimestamp(
+                            res,
+                        ),
+                    }
+                }
+
                 ApiStreamRequestPayload::QueryConsistent(q) => {
                     query(client, request_id, q, true).await
                 }

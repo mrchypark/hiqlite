@@ -34,6 +34,8 @@ pub(crate) enum ClientStreamReq {
     #[cfg(feature = "sqlite")]
     Transaction(ClientTransactionPayload),
     #[cfg(feature = "sqlite")]
+    TransactionWithRaftSerializedTimestamp(ClientTransactionPayload),
+    #[cfg(feature = "sqlite")]
     Query(ClientQueryPayload),
     #[cfg(feature = "sqlite")]
     QueryConsistent(ClientQueryPayload),
@@ -281,6 +283,27 @@ async fn client_stream(
                 }
 
                 #[cfg(feature = "sqlite")]
+                ClientStreamReq::TransactionWithRaftSerializedTimestamp(
+                    ClientTransactionPayload {
+                        request_id,
+                        queries,
+                        ack,
+                    },
+                ) => {
+                    let req = ApiStreamRequest {
+                        request_id,
+                        payload: ApiStreamRequestPayload::TransactionWithRaftSerializedTimestamp(
+                            queries,
+                        ),
+                    };
+                    Some((
+                        WritePayload::Payload(serialize_network(&req)),
+                        request_id,
+                        ack,
+                    ))
+                }
+
+                #[cfg(feature = "sqlite")]
                 ClientStreamReq::Query(ClientQueryPayload {
                     request_id,
                     query,
@@ -516,6 +539,12 @@ async fn client_stream(
                 ClientStreamReq::Transaction(_) => {
                     unreachable!(
                         "we should never receive ClientStreamReq::Transaction from WS reader"
+                    )
+                }
+                #[cfg(feature = "sqlite")]
+                ClientStreamReq::TransactionWithRaftSerializedTimestamp(_) => {
+                    unreachable!(
+                        "we should never receive ClientStreamReq::TransactionWithRaftSerializedTimestamp from WS reader"
                     )
                 }
                 #[cfg(feature = "sqlite")]

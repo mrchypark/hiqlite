@@ -4,7 +4,7 @@ use crate::query::rows::{ColumnOwned, RowOwned, ValueOwned};
 use crate::store::logs;
 use crate::store::state_machine::sqlite::state_machine;
 use crate::store::state_machine::sqlite::state_machine::{
-    Params, StateMachineData, StateMachineSqlite, StoredSnapshot,
+    Params, RaftSerializedTimestamp, StateMachineData, StateMachineSqlite, StoredSnapshot,
 };
 use crate::store::state_machine::sqlite::transaction_env::{
     TransactionEnv, TransactionParamContext,
@@ -71,6 +71,7 @@ pub struct SqlExecuteReturning {
 pub struct SqlTransaction {
     pub queries: Vec<state_machine::Query>,
     pub last_applied_log_id: Option<LogId<NodeId>>,
+    pub raft_serialized_timestamp: Option<RaftSerializedTimestamp>,
     pub tx: oneshot::Sender<Result<Vec<Result<usize, Error>>, Error>>,
 }
 
@@ -344,6 +345,7 @@ CREATE TABLE IF NOT EXISTS _metadata
                                 let ctx = TransactionParamContext {
                                     txn: &txn,
                                     env: &mut txn_env,
+                                    raft_serialized_timestamp: req.raft_serialized_timestamp,
                                 };
                                 match param.into_sql_txn_ctx(ctx) {
                                     Ok(param) => {

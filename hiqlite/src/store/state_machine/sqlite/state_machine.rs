@@ -12,6 +12,7 @@ use crate::store::state_machine::sqlite::writer::{
 };
 use crate::store::{StorageResult, logs};
 use crate::{Error, Node, NodeId};
+use chrono::Utc;
 use openraft::storage::RaftStateMachine;
 use openraft::{
     EntryPayload, LogId, OptionalSend, Snapshot, SnapshotId, SnapshotMeta, StorageError,
@@ -54,12 +55,130 @@ pub enum QueryWrite {
     #[cfg(feature = "backup")]
     Backup((NodeId, i64)),
     RTT,
+    TransactionWithRaftSerializedTimestamp {
+        queries: Vec<Query>,
+        unix_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
     pub sql: Cow<'static, str>,
     pub params: Params,
+}
+
+/// Metadata for a wall-clock Unix millisecond timestamp serialized through Raft.
+///
+/// The timestamp is sampled at Hiqlite's write-admission boundary before the
+/// write command is appended to Raft, then replayed by every replica from the
+/// serialized command. It is not a monotonic cluster time, is not safe against
+/// clock skew or wall-clock rollback, and is not derived from the Raft log
+/// index. The Raft term and log index only identify the log entry that applied
+/// the serialized timestamp.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftSerializedTimestamp {
+    pub unix_ms: i64,
+    pub raft_term: u64,
+    pub raft_log_index: u64,
+}
+
+impl RaftSerializedTimestamp {
+    pub(crate) fn now_unix_ms() -> i64 {
+        Utc::now().timestamp_millis()
+    }
+
+    fn from_log_id(unix_ms: i64, log_id: LogId<NodeId>) -> Self {
+        Self {
+            unix_ms,
+            raft_term: log_id.leader_id.term,
+            raft_log_index: log_id.index,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::helpers::serialize;
+
+    fn variant_tag(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn query_write_bincode_variant_tags_remain_stable_for_existing_commands() {
+        assert_eq!(
+            variant_tag(
+                &serialize(&QueryWrite::Execute(Query {
+                    sql: "SELECT 1".into(),
+                    params: Vec::new(),
+                }))
+                .unwrap()
+            ),
+            0
+        );
+        assert_eq!(
+            variant_tag(
+                &serialize(&QueryWrite::ExecuteReturning(Query {
+                    sql: "SELECT 1".into(),
+                    params: Vec::new(),
+                }))
+                .unwrap()
+            ),
+            1
+        );
+        assert_eq!(
+            variant_tag(&serialize(&QueryWrite::Transaction(Vec::new())).unwrap()),
+            2
+        );
+        assert_eq!(
+            variant_tag(&serialize(&QueryWrite::Batch("SELECT 1".into())).unwrap()),
+            3
+        );
+        assert_eq!(
+            variant_tag(&serialize(&QueryWrite::Migration(Vec::new())).unwrap()),
+            4
+        );
+
+        #[cfg(feature = "backup")]
+        assert_eq!(
+            variant_tag(&serialize(&QueryWrite::Backup((1, 2))).unwrap()),
+            5
+        );
+
+        #[cfg(feature = "backup")]
+        assert_eq!(variant_tag(&serialize(&QueryWrite::RTT).unwrap()), 6);
+
+        #[cfg(not(feature = "backup"))]
+        assert_eq!(variant_tag(&serialize(&QueryWrite::RTT).unwrap()), 5);
+    }
+
+    #[test]
+    fn raft_serialized_timestamp_command_is_append_only_in_bincode_tags() {
+        let command = QueryWrite::TransactionWithRaftSerializedTimestamp {
+            queries: Vec::new(),
+            unix_ms: 1,
+        };
+
+        #[cfg(feature = "backup")]
+        assert_eq!(variant_tag(&serialize(&command).unwrap()), 7);
+
+        #[cfg(not(feature = "backup"))]
+        assert_eq!(variant_tag(&serialize(&command).unwrap()), 6);
+    }
+}
+
+/// Result of a Raft-serialized timestamp transaction.
+///
+/// The outer client `Result` indicates whether the write command was admitted and applied by
+/// Raft. This `result` field contains the SQL transaction outcome after that point, so the
+/// timestamp remains available even when SQLite rolls the transaction back.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RaftSerializedTimestampTransaction {
+    /// SQL transaction outcome after the Raft write command was applied.
+    pub result: Result<Vec<Result<usize, Error>>, Error>,
+    /// The timestamp and Raft metadata for the applied write command.
+    pub timestamp: RaftSerializedTimestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +191,7 @@ pub enum Response {
     Migrate(Result<(), Error>),
     Backup(Result<(), Error>),
     RTT,
+    TransactionWithRaftSerializedTimestamp(RaftSerializedTimestampTransaction),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -725,6 +845,7 @@ impl RaftStateMachine<TypeConfigSqlite> for StateMachineSqlite {
                     let req = WriterRequest::Query(writer::Query::Transaction(SqlTransaction {
                         queries,
                         last_applied_log_id,
+                        raft_serialized_timestamp: None,
                         tx,
                     }));
 
@@ -735,6 +856,30 @@ impl RaftStateMachine<TypeConfigSqlite> for StateMachineSqlite {
 
                     let result = rx.await.expect("to always get a response from sql writer");
                     Response::Transaction(result)
+                }
+
+                EntryPayload::Normal(QueryWrite::TransactionWithRaftSerializedTimestamp {
+                    queries,
+                    unix_ms,
+                }) => {
+                    let (tx, rx) = oneshot::channel();
+                    let timestamp = RaftSerializedTimestamp::from_log_id(unix_ms, entry.log_id);
+                    let req = WriterRequest::Query(writer::Query::Transaction(SqlTransaction {
+                        queries,
+                        last_applied_log_id,
+                        raft_serialized_timestamp: Some(timestamp),
+                        tx,
+                    }));
+
+                    self.write_tx
+                        .send_async(req)
+                        .await
+                        .expect("sql writer to always be listening");
+
+                    let result = rx.await.expect("to always get a response from sql writer");
+                    Response::TransactionWithRaftSerializedTimestamp(
+                        RaftSerializedTimestampTransaction { result, timestamp },
+                    )
                 }
 
                 EntryPayload::Normal(QueryWrite::Batch(sql)) => {
