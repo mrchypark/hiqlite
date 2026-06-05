@@ -1,10 +1,10 @@
 [package]
 name = "hiqlite"
-version = "0.13.2"
+version = "0.14.0-202606024"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-rust-version = "1.88.0"
+rust-version = "1.95.0"
 categories = ["database", "caching"]
 keywords = ["database", "sql", "sqlite", "raft", "cache"]
 description = "Hiqlite - highly-available, embeddable, raft-based SQLite + cache"
@@ -80,11 +80,14 @@ webpki-roots = [
     "dep:webpki-root-certs",
 ]
 
+# Internal use only
+__profiling = ["dep:console-subscriber"]
+
 [dependencies]
-hiqlite-derive = { version = "0.13", optional = true }
-#hiqlite-derive = { path = "../hiqlite-derive", optional = true }
-hiqlite-wal = { version = "0.13" }
-#hiqlite-wal = { path = "../hiqlite-wal" }
+#hiqlite-derive = { version = "0.13", optional = true }
+hiqlite-derive = { path = "../hiqlite-derive", optional = true }
+#hiqlite-wal = { version = "0.13" }
+hiqlite-wal = { path = "../hiqlite-wal" }
 
 argon2 = { workspace = true, optional = true }
 axum.workspace = true
@@ -94,6 +97,7 @@ bincode.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { workspace = true, optional = true }
+console-subscriber = { workspace = true, optional = true }
 cron = { workspace = true, optional = true }
 cryptr = { workspace = true }
 ctrlc = { workspace = true, optional = true }
