@@ -29,9 +29,19 @@ pub enum Param {
     /// The value is a variable referencing the first row of a previous statement in a transaction.
     /// The key is the statement index and a column name.
     StmtOutputNamed(usize, Cow<'static, str>),
+    /// The Unix timestamp in milliseconds serialized into the current Raft transaction command.
+    ///
+    /// This value is only available inside `txn_with_raft_serialized_timestamp`.
+    /// It is a wall-clock sample, not a monotonic cluster time, not clock-skew-safe,
+    /// and not derived from the Raft log index.
+    RaftSerializedUnixMs,
 }
 
 impl Param {
+    pub fn raft_serialized_unix_ms() -> Self {
+        Self::RaftSerializedUnixMs
+    }
+
     pub(crate) fn into_sql<'a>(self) -> ToSqlOutput<'a> {
         let value = match self {
             Param::Null => Value::Null,
@@ -39,8 +49,10 @@ impl Param {
             Param::Real(r) => Value::Real(r),
             Param::Text(t) => Value::Text(t),
             Param::Blob(b) => Value::Blob(b),
-            Param::StmtOutputNamed(..) | Param::StmtOutputIndexed(..) => {
-                panic!("Param::StmtOutput is only valid inside transactions")
+            Param::StmtOutputNamed(..)
+            | Param::StmtOutputIndexed(..)
+            | Param::RaftSerializedUnixMs => {
+                panic!("transaction-only Param variant used outside a transaction")
             }
         };
         ToSqlOutput::Owned(value)
@@ -62,6 +74,7 @@ impl Param {
             Param::StmtOutputNamed(stmt_index, column_name) => {
                 ctx.lookup_statement_output_named(stmt_index, column_name)?
             }
+            Param::RaftSerializedUnixMs => ctx.lookup_raft_serialized_unix_ms()?,
         };
         Ok(ToSqlOutput::Owned(value))
     }
@@ -294,8 +307,40 @@ impl From<StmtColumn<String>> for Param {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::serialize;
     use crate::query::rows::ValueOwned;
     use uuid::{NoContext, Timestamp};
+
+    fn variant_tag(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn bincode_variant_tags_remain_stable_for_existing_params() {
+        assert_eq!(variant_tag(&serialize(&Param::Null).unwrap()), 0);
+        assert_eq!(variant_tag(&serialize(&Param::Integer(1)).unwrap()), 1);
+        assert_eq!(variant_tag(&serialize(&Param::Real(1.0)).unwrap()), 2);
+        assert_eq!(
+            variant_tag(&serialize(&Param::Text(String::new())).unwrap()),
+            3
+        );
+        assert_eq!(
+            variant_tag(&serialize(&Param::Blob(Vec::new())).unwrap()),
+            4
+        );
+        assert_eq!(
+            variant_tag(&serialize(&Param::StmtOutputIndexed(0, 0)).unwrap()),
+            5
+        );
+        assert_eq!(
+            variant_tag(&serialize(&Param::StmtOutputNamed(0, "id".into())).unwrap()),
+            6
+        );
+        assert_eq!(
+            variant_tag(&serialize(&Param::RaftSerializedUnixMs).unwrap()),
+            7
+        );
+    }
 
     #[test]
     fn make_sure_uuid_be_bytes() {
@@ -309,6 +354,12 @@ mod tests {
         // The `impl TryFrom<ValueOwned> for uuid::Uuid` uses `from_be_bytes()` explicitly.
         let uuid_back = Uuid::try_from(v).unwrap();
         assert_eq!(uuid, uuid_back);
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction-only Param variant used outside a transaction")]
+    fn raft_serialized_unix_ms_fails_outside_transaction_context() {
+        let _ = Param::raft_serialized_unix_ms().into_sql();
     }
 
     #[test]

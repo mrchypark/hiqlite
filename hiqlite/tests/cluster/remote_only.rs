@@ -3,7 +3,7 @@ use crate::start::SECRET_API;
 use crate::{Cache, check, log, start};
 use chrono::Utc;
 use hiqlite::macros::params;
-use hiqlite::{Client, Error, Lock};
+use hiqlite::{Client, Error, Lock, Param};
 use std::time::Duration;
 use tokio::{task, time};
 
@@ -21,6 +21,18 @@ pub async fn test_remote_only_client() -> Result<(), Error> {
 
     let client_2 = Client::remote(nodes, false, false, SECRET_API.to_string(), false).await?;
     check_client(&client_2, 2).await?;
+
+    log("Make sure remote clients can skip leader discovery with a single API endpoint");
+    let single_endpoint_nodes = vec![start::nodes()[0].addr_api.clone()];
+    let single_endpoint_client = Client::remote(
+        single_endpoint_nodes,
+        false,
+        false,
+        SECRET_API.to_string(),
+        true,
+    )
+    .await?;
+    check_client(&single_endpoint_client, 3).await?;
 
     log("Test Listen / Notify with remote clients");
     let msg = TestData {
@@ -112,6 +124,53 @@ async fn check_client(client: &Client, id: u64) -> Result<(), Error> {
         data[1].description.as_deref(),
         Some("Transaction Data id 1002")
     );
+
+    let remote_id = 2000 + id as i64;
+    let timestamp_txn = client
+        .txn_with_raft_serialized_timestamp([(
+            sql,
+            params!(
+                remote_id,
+                Param::raft_serialized_unix_ms(),
+                format!("Remote Raft Serialized Timestamp Data id {remote_id}")
+            ),
+        )])
+        .await?;
+    let timestamp = timestamp_txn.timestamp;
+    let results = timestamp_txn.result?;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_ok());
+    assert!(timestamp.unix_ms > 0);
+    assert!(timestamp.raft_log_index > 0);
+
+    let data: TestData = client
+        .query_map_one("SELECT * FROM test WHERE id = $1", params!(remote_id))
+        .await?;
+    assert_eq!(data.id, remote_id);
+    assert_eq!(data.ts, timestamp.unix_ms);
+    assert_eq!(
+        data.description.as_deref(),
+        Some(format!("Remote Raft Serialized Timestamp Data id {remote_id}").as_str())
+    );
+
+    let failed_timestamp_txn = client
+        .txn_with_raft_serialized_timestamp([(
+            sql,
+            params!(
+                remote_id,
+                Param::raft_serialized_unix_ms(),
+                format!("Failed Remote Raft Serialized Timestamp Data id {remote_id}")
+            ),
+        )])
+        .await?;
+    assert!(failed_timestamp_txn.timestamp.unix_ms > 0);
+    assert!(failed_timestamp_txn.timestamp.raft_log_index > timestamp.raft_log_index);
+    assert!(failed_timestamp_txn.result.is_err());
+
+    let rows_affected = client
+        .execute("DELETE FROM test WHERE id = $1", params!(remote_id))
+        .await?;
+    assert_eq!(rows_affected, 1);
 
     // batch
     let results = client

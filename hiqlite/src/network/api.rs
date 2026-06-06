@@ -32,7 +32,9 @@ use crate::store::state_machine::memory::dlock_handler::{
 use crate::{
     migration::Migration,
     query::{query_consistent_local, query_owned_local, rows::RowOwned},
-    store::state_machine::sqlite::state_machine::{Query, QueryWrite},
+    store::state_machine::sqlite::state_machine::{
+        Query, QueryWrite, RaftSerializedTimestamp, RaftSerializedTimestampTransaction,
+    },
 };
 
 #[cfg(feature = "listen_notify")]
@@ -434,6 +436,9 @@ pub(crate) enum ApiStreamRequestPayload {
     LockAwait(CacheRequest),
     #[cfg(feature = "listen_notify_local")]
     Notify(CacheRequest),
+
+    #[cfg(feature = "sqlite")]
+    TransactionWithRaftSerializedTimestamp(Vec<Query>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -470,6 +475,272 @@ pub(crate) enum ApiStreamResponsePayload {
 
     #[cfg(feature = "listen_notify_local")]
     Notify(Result<(), Error>),
+
+    #[cfg(feature = "sqlite")]
+    TransactionWithRaftSerializedTimestamp(Result<RaftSerializedTimestampTransaction, Error>),
+}
+
+#[cfg(test)]
+mod bincode_tag_tests {
+    use super::*;
+    use crate::helpers::serialize;
+
+    fn variant_tag(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn api_stream_request_bincode_variant_tags_remain_stable() {
+        let mut tag = 0;
+
+        #[cfg(feature = "sqlite")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::Execute(Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                    }))
+                    .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::ExecuteReturning(Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                    }))
+                    .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamRequestPayload::Transaction(Vec::new())).unwrap()),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::QueryConsistent(Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                    }))
+                    .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::Batch("SELECT 1".into())).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamRequestPayload::Migrate(Vec::new())).unwrap()),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "backup")]
+        {
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamRequestPayload::Backup((1, 2))).unwrap()),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "cache")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::KV(CacheRequest::ClearAll)).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "sqlite")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::Query(Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                    }))
+                    .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "cache")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::KVGet(CacheRequest::ClearAll)).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "dlock")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::LockAwait(CacheRequest::ClearAll))
+                        .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "listen_notify_local")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamRequestPayload::Notify(CacheRequest::ClearAll)).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "sqlite")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(
+                        &ApiStreamRequestPayload::TransactionWithRaftSerializedTimestamp(Vec::new())
+                    )
+                    .unwrap()
+                ),
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn api_stream_response_bincode_variant_tags_remain_stable() {
+        let mut tag = 0;
+
+        #[cfg(feature = "sqlite")]
+        {
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Execute(Ok(1))).unwrap()),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamResponsePayload::ExecuteReturning(Ok(Vec::new())))
+                        .unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamResponsePayload::Transaction(Ok(Vec::new()))).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Query(Ok(Vec::new()))).unwrap()),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamResponsePayload::QueryConsistent(Ok(Vec::new()))).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Batch(Ok(Vec::new()))).unwrap()),
+                tag
+            );
+            tag += 1;
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Migrate(Ok(()))).unwrap()),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "backup")]
+        {
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Backup(Ok(()))).unwrap()),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "cache")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamResponsePayload::KV(Ok(CacheResponse::Empty))).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "dlock")]
+        {
+            assert_eq!(
+                variant_tag(
+                    &serialize(&ApiStreamResponsePayload::Lock(LockState::Released)).unwrap()
+                ),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "listen_notify_local")]
+        {
+            assert_eq!(
+                variant_tag(&serialize(&ApiStreamResponsePayload::Notify(Ok(()))).unwrap()),
+                tag
+            );
+            tag += 1;
+        }
+
+        #[cfg(feature = "sqlite")]
+        {
+            let res = RaftSerializedTimestampTransaction {
+                result: Ok(Vec::new()),
+                timestamp: RaftSerializedTimestamp {
+                    unix_ms: 1,
+                    raft_term: 1,
+                    raft_log_index: 1,
+                },
+            };
+            assert_eq!(
+                variant_tag(
+                    &serialize(
+                        &ApiStreamResponsePayload::TransactionWithRaftSerializedTimestamp(Ok(res))
+                    )
+                    .unwrap()
+                ),
+                tag
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -644,6 +915,43 @@ async fn handle_socket_concurrent(
                         Err(err) => ApiStreamResponse {
                             request_id,
                             result: ApiStreamResponsePayload::Transaction(Err(Error::from(err))),
+                        },
+                    }
+                }
+
+                #[cfg(feature = "sqlite")]
+                ApiStreamRequestPayload::TransactionWithRaftSerializedTimestamp(queries) => {
+                    match state
+                        .raft_db
+                        .raft
+                        .client_write(QueryWrite::TransactionWithRaftSerializedTimestamp {
+                            queries,
+                            unix_ms: RaftSerializedTimestamp::now_unix_ms(),
+                        })
+                        .await
+                    {
+                        Ok(resp) => {
+                            let resp: crate::Response = resp.data;
+                            let res = match resp {
+                                crate::Response::TransactionWithRaftSerializedTimestamp(res) => {
+                                    Ok(res)
+                                }
+                                _ => unreachable!(),
+                            };
+                            ApiStreamResponse {
+                                request_id,
+                                result:
+                                    ApiStreamResponsePayload::TransactionWithRaftSerializedTimestamp(
+                                        res,
+                                    ),
+                            }
+                        }
+                        Err(err) => ApiStreamResponse {
+                            request_id,
+                            result:
+                                ApiStreamResponsePayload::TransactionWithRaftSerializedTimestamp(
+                                    Err(Error::from(err)),
+                                ),
                         },
                     }
                 }

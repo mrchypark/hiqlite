@@ -4,6 +4,11 @@
 
 - Added `NodeConfig::learner_only`, `learner_only`, and `HQL_LEARNER_ONLY` to let newly joining
   nodes stay learners during startup reconciliation instead of being promoted to voting members.
+- Added `Client::txn_with_raft_serialized_timestamp`, `Param::raft_serialized_unix_ms()`,
+  `RaftSerializedTimestamp`, and `RaftSerializedTimestampTransaction` for binding the same
+  Raft-serialized wall-clock Unix millisecond sample across all statements in one SQLite
+  transaction and returning it with the applied Raft term and log index metadata. This timestamp
+  is not a monotonic cluster time.
 
 ## hiqlite-v0.13.2
 
